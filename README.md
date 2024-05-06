@@ -52,7 +52,6 @@ import glob
 import json
 
 from airflow import DAG
-from airflow.operators.empty import EmptyOperator
 from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.utils import timezone
@@ -62,19 +61,9 @@ The function _get_files takes a parameter filepath, representing the directory p
 
 ```bash
 def _get_files(filepath: str):
-    """
-    Description: This function is responsible for listing the files in a directory
-    """
-
-    all_files = []
-    for root, dirs, files in os.walk(filepath):
-        files = glob.glob(os.path.join(root, "*.json"))
-        for f in files:
-            all_files.append(os.path.abspath(f))
-
+    all_files = [os.path.abspath(f) for f in glob.glob(os.path.join(filepath, "*.json"))]
     num_files = len(all_files)
     print(f"{num_files} files found in {filepath}")
-
     return all_files
 ```
 
@@ -82,33 +71,28 @@ The function definition for creating tables in a PostgreSQL database includes SQ
 
 ```bash
 def _create_table():
-    table_create_actors = """
+    create_table_queries = [
+        """
         CREATE TABLE IF NOT EXISTS actors (
-            id int,
-            login text,
-            PRIMARY KEY(id)
+            id int PRIMARY KEY,
+            login text
         )
-    """
-    table_create_events = """
+        """,
+        """
         CREATE TABLE IF NOT EXISTS events (
-            id text,
+            id text PRIMARY KEY,
             type text,
             actor_id int,
-            PRIMARY KEY(id),
             CONSTRAINT fk_actor FOREIGN KEY(actor_id) REFERENCES actors(id)
         )
-    """
-
-    create_table_queries = [
-        table_create_actors,
-        table_create_events,
+        """
     ]
     hook = PostgresHook(postgres_conn_id="my_postgres_conn")
-    conn = hook.get_conn()
-    cur = conn.cursor()
-    for query in create_table_queries:
-        cur.execute(query)
-        conn.commit()
+    with hook.get_conn() as conn:
+        with conn.cursor() as cur:
+            for query in create_table_queries:
+                cur.execute(query)
+                conn.commit()
 ```
 
 This function processes JSON data, inserting it into PostgreSQL tables. It connects to the database using PostgresHook and creates a cursor object to execute SQL queries. It retrieves the task instance object (ti) from the context dictionary, accessing XCom data. It gets the list of file paths (all_files) from the XCom data of the task with ID "get_files" using ti's xcom_pull method. For each file path, it loads the file contents into a Python dictionary named data. Then, it iterates over each JSON object in the data dictionary. If the object's "type" attribute is "IssueCommentEvent", it prints specific attributes including "id", "type", "actor", "repo", "created_at" timestamp, and issue URL from "payload". Otherwise, it prints similar attributes excluding the issue URL. After printing, it constructs SQL INSERT statements for the "actors" and "events" tables, using ON CONFLICT to handle conflicts. The constructed statements are executed using the cursor (cur). Finally, the changes are committed to the database, ensuring permanent saving.
@@ -116,67 +100,27 @@ This function processes JSON data, inserting it into PostgreSQL tables. It conne
 ```bash
 def _process(**context):
     hook = PostgresHook(postgres_conn_id="my_postgres_conn")
-    conn = hook.get_conn()
-    cur = conn.cursor()
+    with hook.get_conn() as conn:
+        with conn.cursor() as cur:
+            ti = context["ti"]
+            all_files = ti.xcom_pull(task_ids="get_files", key="return_value")
+            for datafile in all_files:
+                with open(datafile, "r") as f:
+                    data = json.load(f)
+                    for each in data:
+                        insert_actor_query = f"""
+                            INSERT INTO actors (id, login) VALUES ({each["actor"]["id"]}, '{each["actor"]["login"]}')
+                            ON CONFLICT (id) DO NOTHING
+                        """
+                        cur.execute(insert_actor_query)
 
-    ti = context["ti"]
+                        insert_event_query = f"""
+                            INSERT INTO events (id, type, actor_id) VALUES ('{each["id"]}', '{each["type"]}', {each["actor"]["id"]})
+                            ON CONFLICT (id) DO NOTHING
+                        """
+                        cur.execute(insert_event_query)
 
-    # Get list of files from filepath
-    all_files = ti.xcom_pull(task_ids="get_files", key="return_value")
-    # all_files = get_files(filepath)
-
-    for datafile in all_files:
-        with open(datafile, "r") as f:
-            data = json.loads(f.read())
-            for each in data:
-                # Print some sample data
-                
-                if each["type"] == "IssueCommentEvent":
-                    print(
-                        each["id"], 
-                        each["type"],
-                        each["actor"]["id"],
-                        each["actor"]["login"],
-                        each["repo"]["id"],
-                        each["repo"]["name"],
-                        each["created_at"],
-                        each["payload"]["issue"]["url"],
-                    )
-                else:
-                    print(
-                        each["id"], 
-                        each["type"],
-                        each["actor"]["id"],
-                        each["actor"]["login"],
-                        each["repo"]["id"],
-                        each["repo"]["name"],
-                        each["created_at"],
-                    )
-
-                # Insert data into tables here
-                insert_statement = f"""
-                    INSERT INTO actors (
-                        id,
-                        login
-                    ) VALUES ({each["actor"]["id"]}, '{each["actor"]["login"]}')
-                    ON CONFLICT (id) DO NOTHING
-                """
-                # print(insert_statement)
-                cur.execute(insert_statement)
-
-                # Insert data into tables here
-                insert_statement = f"""
-                    INSERT INTO events (
-                        id,
-                        type,
-                        actor_id
-                    ) VALUES ('{each["id"]}', '{each["type"]}', '{each["actor"]["id"]}')
-                    ON CONFLICT (id) DO NOTHING
-                """
-                # print(insert_statement)
-                cur.execute(insert_statement)
-
-                conn.commit()
+            conn.commit()
 ```
 
 The "etl" DAG, starting on April 8, 2024, runs daily and is tagged "swu." It begins with the "start" EmptyOperator and then branches to "get_files" and "create_tables" executed in parallel. Next, the "process" PythonOperator runs after both previous tasks complete. Finally, the "end" EmptyOperator concludes the DAG.
@@ -184,31 +128,26 @@ The "etl" DAG, starting on April 8, 2024, runs daily and is tagged "swu." It beg
 ```bash
 with DAG(
     "etl",
-    start_date=timezone.datetime(2024,4,8),
+    start_date=timezone.datetime(2024, 4, 8),
     schedule="@daily",
     tags=["swu"],
-):
-
-    start = EmptyOperator(task_id="start")
+) as dag:
 
     get_files = PythonOperator(
-        task_id = "get_files",
+        task_id="get_files",
         python_callable=_get_files,
-        #op_args=["opt/airflow/dags/data"], ##List
-        op_kwargs={"filepath" : "/opt/airflow/dags/data"},
+        op_kwargs={"filepath": "/opt/airflow/dags/data"},
     )
 
     create_tables = PythonOperator(
-        task_id = "create_tables",
+        task_id="create_tables",
         python_callable=_create_table,
     )
 
     process = PythonOperator(
-        task_id = "process",
+        task_id="process",
         python_callable=_process,
     )
 
-    end = EmptyOperator(task_id="end")
-    
-    start >> [get_files, create_tables] >> process >> end
+    get_files >> create_tables >> process
 ```
